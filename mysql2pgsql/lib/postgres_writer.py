@@ -7,12 +7,14 @@ from datetime import datetime, date, timedelta
 from psycopg2.extensions import QuotedString, Binary, AsIs
 from pytz import timezone
 
+from .string_converter import StringConverter
 
 class PostgresWriter(object):
     """Base class for :py:class:`mysql2pgsql.lib.postgres_file_writer.PostgresFileWriter`
     and :py:class:`mysql2pgsql.lib.postgres_db_writer.PostgresDbWriter`.
     """
-    def __init__(self, tz=False, index_prefix=''):
+    def __init__(self, tz=False, index_prefix='', case_converter='none'):
+        self.converter = getattr(StringConverter(), case_converter)
         self.column_types = {}
         self.index_prefix = index_prefix
         if tz:
@@ -22,8 +24,11 @@ class PostgresWriter(object):
             self.tz = None
             self.tz_offset = ''
 
+    def convert_case(self, string):
+        return self.converter(string)
+
     def column_description(self, column):
-        return '"%s" %s' % (column['name'], self.column_type_info(column))
+        return '"%s" %s' % (self.convert_case(column['name']), self.column_type_info(column))
 
     def column_type(self, column):
         hash_key = hash(frozenset(column.items()))
@@ -113,7 +118,7 @@ class PostgresWriter(object):
                 enum = re.sub(r'^enum\(|\)$', '', column['type'])
                 # TODO: will work for "'.',',',''''" but will fail for "'.'',','.'"
                 max_enum_size = max([len(e.replace("''", "'")) for e in enum.split("','")])
-                return default, ' character varying(%s) check("%s" in (%s))' % (max_enum_size, column['name'], enum)
+                return default, ' character varying(%s) check("%s" in (%s))' % (max_enum_size, self.convert_case(column['name']), enum)
             elif column['type'].startswith('bit('):
                 return ' DEFAULT %s' % column['default'].upper() if column['default'] else column['default'], 'varbit(%s)' % re.search(r'\((\d+)\)', column['type']).group(1)
             elif column['type'].startswith('set('):
@@ -127,26 +132,26 @@ class PostgresWriter(object):
 
         if column.get('auto_increment', None):
             return '%s DEFAULT nextval(\'"%s_%s_seq"\'::regclass) NOT NULL' % (
-                   column_type, column['table_name'], column['name'])
-                    
+                   column_type, self.convert_case(column['table_name']), self.convert_case(column['name']))
+
         return '%s%s%s' % (column_type, (default if not default == None else ''), null)
 
     def table_comments(self, table):
         comments = StringIO()
-        if table.comment: 
+        if table.comment:
           comments.write(self.table_comment(table.name, table.comment))
         for column in table.columns:
           comments.write(self.column_comment(table.name, column))
-        return comments.getvalue() 
+        return comments.getvalue()
 
     def column_comment(self, tablename, column):
-      if column['comment']: 
-        return (' COMMENT ON COLUMN %s.%s is %s;' % ( tablename, column['name'], QuotedString(column['comment']).getquoted()))
-      else: 
+      if column['comment']:
+        return (' COMMENT ON COLUMN %s.%s is %s;' % ( self.convert_case(tablename), self.convert_case(column['name']), QuotedString(column['comment']).getquoted()))
+      else:
         return ''
 
     def table_comment(self, tablename, comment):
-        return (' COMMENT ON TABLE %s is %s;' % ( tablename, QuotedString(comment).getquoted()))
+        return (' COMMENT ON TABLE %s is %s;' % ( self.convert_case(tablename), QuotedString(comment).getquoted()))
 
     def process_row(self, table, row):
         """Examines row data from MySQL and alters
@@ -199,10 +204,10 @@ class PostgresWriter(object):
 
         for column in table.columns:
             if column['auto_increment']:
-                serial_key = column['name']
+                serial_key = self.convert_case(column['name'])
                 maxval = 1 if column['maxval'] < 1 else column['maxval'] + 1
             if column['primary_key']:
-                primary_keys.append(column['name'])
+                primary_keys.append(self.convert_case(column['name']))
             columns.write('  %s,\n' % self.column_description(column))
         return primary_keys, serial_key, maxval, columns.getvalue()[:-2]
 
@@ -212,15 +217,15 @@ class PostgresWriter(object):
 
         for column in table.columns:
             if column['auto_increment']:
-                serial_key = column['name']
+                serial_key = self.convert_case(column['name'])
                 maxval = 1 if column['maxval'] < 1 else column['maxval'] + 1
 
-        truncate_sql = 'TRUNCATE "%s" CASCADE;' % table.name
+        truncate_sql = 'TRUNCATE "%s" CASCADE;' % self.convert_case(table.name)
         serial_key_sql = None
 
         if serial_key:
             serial_key_sql = "SELECT pg_catalog.setval(pg_get_serial_sequence(%(table_name)s, %(serial_key)s), %(maxval)s, true);" % {
-                'table_name': QuotedString('"%s"' % table.name).getquoted(),
+                'table_name': QuotedString('"%s"' % self.convert_case(table.name)).getquoted(),
                 'serial_key': QuotedString(serial_key).getquoted(),
                 'maxval': maxval}
 
@@ -231,14 +236,14 @@ class PostgresWriter(object):
         serial_key_sql = []
         table_sql = []
         if serial_key:
-            serial_key_seq = '%s_%s_seq' % (table.name, serial_key)
+            serial_key_seq = '%s_%s_seq' % (self.convert_case(table.name), serial_key)
             serial_key_sql.append('DROP SEQUENCE IF EXISTS "%s" CASCADE;' % serial_key_seq)
             serial_key_sql.append("""CREATE SEQUENCE "%s" INCREMENT BY 1
                                   NO MAXVALUE NO MINVALUE CACHE 1;""" % serial_key_seq)
             serial_key_sql.append('SELECT pg_catalog.setval(\'"%s"\', %s, true);' % (serial_key_seq, maxval))
 
-        table_sql.append('DROP TABLE IF EXISTS "%s" CASCADE;' % table.name)
-        table_sql.append('CREATE TABLE "%s" (\n%s\n)\nWITHOUT OIDS;' % (table.name.encode('utf8'), columns))
+        table_sql.append('DROP TABLE IF EXISTS "%s" CASCADE;' % self.convert_case(table.name))
+        table_sql.append('CREATE TABLE "%s" (\n%s\n)\nWITHOUT OIDS;' % (self.convert_case(table.name).encode('utf8'), columns))
         table_sql.append( self.table_comments(table))
         return (table_sql, serial_key_sql)
 
@@ -248,22 +253,22 @@ class PostgresWriter(object):
         index_prefix = self.index_prefix
         if primary_index:
             index_sql.append('ALTER TABLE "%(table_name)s" ADD CONSTRAINT "%(index_name)s_pkey" PRIMARY KEY(%(column_names)s);' % {
-                    'table_name': table.name,
-                    'index_name': '%s%s_%s' % (index_prefix, table.name, 
-                                        '_'.join(primary_index[0]['columns'])),
-                    'column_names': ', '.join('"%s"' % col for col in primary_index[0]['columns']),
+                    'table_name': self.convert_case(table.name),
+                    'index_name': '%s%s_%s' % (index_prefix, self.convert_case(table.name),
+                                        '_'.join(list(map((lambda column: self.convert_case(column)), primary_index[0]['columns'])))),
+                    'column_names': ', '.join('"%s"' % col for col in list(map((lambda column: self.convert_case(column)), primary_index[0]['columns']))),
                     })
         for index in table.indexes:
             if 'primary' in index:
                 continue
             unique = 'UNIQUE ' if index.get('unique', None) else ''
-            index_name = '%s%s_%s' % (index_prefix, table.name, '_'.join(index['columns']))
+            index_name = '%s%s_%s' % (index_prefix, self.convert_case(table.name), '_'.join(list(map((lambda column: self.convert_case(column)), index['columns']))))
             index_sql.append('DROP INDEX IF EXISTS "%s" CASCADE;' % index_name)
             index_sql.append('CREATE %(unique)sINDEX "%(index_name)s" ON "%(table_name)s" (%(column_names)s);' % {
                     'unique': unique,
                     'index_name': index_name,
-                    'table_name': table.name,
-                    'column_names': ', '.join('"%s"' % col for col in index['columns']),
+                    'table_name': self.convert_case(table.name),
+                    'column_names': ', '.join('"%s"' % col for col in list(map((lambda column: self.convert_case(column)), index['columns']))),
                     })
 
         return index_sql
@@ -273,10 +278,10 @@ class PostgresWriter(object):
         for key in table.foreign_keys:
             constraint_sql.append("""ALTER TABLE "%(table_name)s" ADD FOREIGN KEY ("%(column_name)s")
             REFERENCES "%(ref_table_name)s"(%(ref_column_name)s);""" % {
-                'table_name': table.name,
-                'column_name': key['column'],
-                'ref_table_name': key['ref_table'],
-                'ref_column_name': key['ref_column']})
+                'table_name': self.convert_case(table.name),
+                'column_name': self.convert_case(key['column']),
+                'ref_table_name': self.convert_case(key['ref_table']),
+                'ref_column_name': self.convert_case(key['ref_column'])})
         return constraint_sql
 
     def write_triggers(self, table):
@@ -288,20 +293,20 @@ class PostgresWriter(object):
             RETURN NULL;
             END;
             $%(trigger_name)s$ LANGUAGE plpgsql;""" % {
-                'table_name': table.name,
+                'table_name': self.convert_case(table.name),
                 'trigger_time': key['timing'],
                 'trigger_event': key['event'],
-                'trigger_name': key['name'],
-                'fn_trigger_name': 'fn_' + key['name'] + '()',
+                'trigger_name': self.convert_case(key['name']),
+                'fn_trigger_name': 'fn_' + self.convert_case(key['name']) + '()',
                 'trigger_statement': key['statement']})
 
             trigger_sql.append("""CREATE TRIGGER %(trigger_name)s %(trigger_time)s %(trigger_event)s ON %(table_name)s
             FOR EACH ROW
             EXECUTE PROCEDURE fn_%(trigger_name)s();""" % {
-                'table_name': table.name,
+                'table_name': self.convert_case(table.name),
                 'trigger_time': key['timing'],
                 'trigger_event': key['event'],
-                'trigger_name': key['name']})
+                'trigger_name': self.convert_case(key['name'])})
 
         return trigger_sql
 

@@ -203,4 +203,4 @@ class PostgresDbWriter(PostgresWriter):
         Returns None
         """
         f = self.FileObjFaker(table, reader.read(table), self.process_row, self.verbose)
-        self.copy_from(f, '"%s"' % table.name, ['"%s"' % c['name'] for c in table.columns])
+        self.copy_from(f, '"%s"' % super(PostgresFileWriter, self).convert_case(table.name), ['"%s"' % super(PostgresFileWriter, self).convert_case(c['name']) for c in table.columns])
