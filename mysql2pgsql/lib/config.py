@@ -85,6 +85,6 @@ timezone: false
 index_prefix:
 
 # table/column name converter
-convert_case:
-  converter: none
+case_converter: none
+# case_converter: camel_to_snake
 """
